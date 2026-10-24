@@ -1,5 +1,9 @@
-from pathlib import Path
+import asyncio
+import os
 import traceback
+from contextlib import asynccontextmanager
+from pathlib import Path
+
 import uvicorn
 
 from fastapi import FastAPI, Request
@@ -14,6 +18,14 @@ from backend import (
     request_cancellation,
     run_travel_agent,
 )
+from booking import (
+    BrowserSession,
+    ProviderError,
+    available_kinds,
+    close_provider,
+    provider_mode,
+    resolve_adapter,
+)
 
 # This is to allow nested event loops for async calls in FastAPI
 import nest_asyncio
@@ -22,10 +34,22 @@ nest_asyncio.apply()
 
 BASE_DIR = Path(__file__).resolve().parent
 
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Shut the browser down when the server stops."""
+    try:
+        yield
+    finally:
+        # Playwright teardown blocks while Chromium exits, so keep it off
+        # the event loop.
+        await asyncio.to_thread(close_provider)
+
+
 app = FastAPI(
     title="TripMate AI",
     description="LangGraph Multi-Agent Travel Planner with FastAPI Frontend",
-    version="1.1.0"
+    version="1.1.0",
+    lifespan=lifespan,
 )
 
 
@@ -57,6 +81,26 @@ class ApprovalRequest(BaseModel):
 class CancelRequest(BaseModel):
     thread_id: str
     reference: str | None = None
+
+
+class BrowserSearchRequest(BaseModel):
+    kind: str = "flight"                      # flight | hotel
+    origin: str = ""
+    destination: str = ""
+    start_date: str = ""
+    end_date: str = ""
+    travelers: list[dict] | None = None
+    currency: str = "USD"
+    limit: int = 5
+
+
+def _playwright_installed() -> bool:
+    try:
+        import playwright  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
 
 
 def _booking_payload(result: dict) -> dict:
@@ -204,6 +248,89 @@ async def booking_status(thread_id: str):
             content={"success": False, "error": str(error)}
         )
 
+
+
+@app.get("/api/browser/status")
+async def browser_status():
+    """Report whether browser automation is available and how it is set up."""
+    return {
+        "success": True,
+        "provider_mode": provider_mode(),
+        "browser_enabled": provider_mode() == "playwright",
+        "adapters": available_kinds(),
+        "headless": str(os.getenv("BROWSER_HEADLESS", "true")).lower() not in {
+            "0", "false", "no", "off",
+        },
+        "playwright_installed": _playwright_installed(),
+    }
+
+
+@app.post("/api/browser/search")
+async def browser_search(request_data: BrowserSearchRequest):
+    """Run a live browser search against a booking site.
+
+    This is the read-only half of the automation: it never books anything.
+    """
+    try:
+        kind = (request_data.kind or "flight").strip().lower()
+        if kind not in available_kinds():
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "error": f"Unknown kind '{kind}'. Use one of: "
+                    f"{', '.join(available_kinds())}",
+                },
+            )
+
+        travelers = request_data.travelers or [{"name": "Guest", "type": "adult"}]
+        plan = {
+            "origin": request_data.origin,
+            "destination": request_data.destination,
+            "start_date": request_data.start_date,
+            "end_date": request_data.end_date,
+            "currency": request_data.currency,
+            "travelers": travelers,
+        }
+
+        adapter = resolve_adapter(kind)
+        limit = max(1, int(request_data.limit or 5))
+
+        def _search():
+            # A fresh session per request keeps one bad site from poisoning
+            # the next search. It also means the (blocking) Playwright call
+            # stays off the event loop.
+            session = BrowserSession()
+            try:
+                return session.run(
+                    lambda page: adapter.search(page, plan, travelers, limit=limit)
+                )
+            finally:
+                session.close()
+
+        offers = await asyncio.to_thread(_search)
+
+        return JSONResponse(
+            content={
+                "success": True,
+                "kind": kind,
+                "provider": adapter.name,
+                "count": len(offers),
+                "offers": [offer.to_dict() for offer in offers],
+            }
+        )
+    except ProviderError as error:
+        return JSONResponse(
+            status_code=502,
+            content={"success": False, "error": str(error), "payload": error.payload},
+        )
+    except Exception as error:
+        print("BROWSER SEARCH ERROR:", error)
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": str(error)},
+        )
 
 
 @app.get("/health")

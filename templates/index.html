@@ -119,6 +119,26 @@
                 <div id="approvalSection" class="approval-section hidden">
                     <h2 class="approval-title">🔒 Approval required</h2>
                     <div id="approvalNotice" class="approval-notice"></div>
+
+                    <details id="tripDetails" class="trip-details hidden" open>
+                        <summary>Review the full trip details before you approve</summary>
+                        <div id="tripSummary" class="trip-summary"></div>
+                        <div class="trip-detail-grid">
+                            <div id="tripOptionsCard" class="trip-detail-card">
+                                <h4>All options considered</h4>
+                                <div id="tripOptions"></div>
+                            </div>
+                            <div id="tripItineraryCard" class="trip-detail-card">
+                                <h4>🗓️ Day-by-day itinerary</h4>
+                                <div id="tripItinerary" class="trip-markdown"></div>
+                            </div>
+                            <div id="tripWeatherCard" class="trip-detail-card">
+                                <h4>🌤️ Weather</h4>
+                                <div id="tripWeather" class="trip-markdown"></div>
+                            </div>
+                        </div>
+                    </details>
+
                     <div id="approvalCards" class="approval-grid"></div>
                     <div id="approvalTotal" class="approval-total"></div>
 

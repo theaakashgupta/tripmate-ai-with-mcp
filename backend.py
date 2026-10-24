@@ -553,6 +553,9 @@ Important:
 - Include weather-based travel advice.
 - Keep the response useful for real travel planning.
 - Never claim a booking was made unless the Booking Status says BOOKED.
+- If the Booking Status is AWAITING_PAYMENT, say the reservation is being
+  held and the traveller must finish the payment on the provider's site.
+  Do not say it is booked, ticketed or paid.
 """
 
     answer = ask(
@@ -575,7 +578,7 @@ Important:
 # Booking workflow (approval-gated)
 #
 # DRAFT → OPTIONS_READY → AWAITING_USER_APPROVAL → REVALIDATING →
-# BOOKING_IN_PROGRESS → BOOKED / BOOKING_FAILED
+# BOOKING_IN_PROGRESS → BOOKED / AWAITING_PAYMENT / BOOKING_FAILED
 # Any material change sends the flow back to
 # APPROVAL_REQUIRED_AGAIN, and cancellations go through
 # CANCEL_PENDING → CANCELLED.
@@ -825,6 +828,34 @@ def plan_agent(state: TravelState):
     }
 
 
+def _live_offers(provider, plan: dict, travelers: list) -> tuple[list, list]:
+    """Live results from a browser-driven provider.
+
+    Returns ``(flights, hotels)``. Any provider that cannot look up a
+    live price simply returns empty lists and the researched options are
+    used instead.
+    """
+    search = getattr(provider, "search_offers", None)
+    if not callable(search):
+        return [], []
+
+    def _run(kind: str) -> list:
+        try:
+            offers = search(kind, plan, travelers, limit=3)
+        except Exception as error:  # a site that is down must not break the plan
+            print(f"LIVE {kind} SEARCH FAILED:", error)
+            return []
+        result = []
+        for offer in offers or []:
+            try:
+                result.append(offer.to_dict())
+            except Exception:
+                continue
+        return result
+
+    return _run("flight"), _run("hotel")
+
+
 def options_agent(state: TravelState):
     """Compare available options, quote them, estimate the trip cost."""
     plan = state.get("plan") or {}
@@ -878,6 +909,73 @@ Hotel research:
 
     options = []
     quotes = {}
+
+    # A provider that drives a real browser knows what the site has right
+    # now. Its live results replace the prices found on the open web, so
+    # the user approves an offer that can actually be bought.
+    live_flights, live_hotels = _live_offers(provider, plan, travelers)
+    live_notes = []
+    if live_flights:
+        live_notes.append(f"{len(live_flights)} live flight(s)")
+    if live_hotels:
+        live_notes.append(f"{len(live_hotels)} live hotel(s)")
+
+    for index, offer in enumerate(live_flights[:3], start=1):
+        details = dict(offer.get("details") or {})
+        option = make_option(
+            option_id=f"fl_{index}",
+            kind="flight",
+            title=str(offer.get("title") or "Flight option"),
+            subtitle=str(offer.get("subtitle") or ""),
+            details={
+                "airline": str(offer.get("title") or ""),
+                "route": f"{plan.get('origin') or ''} → {plan.get('destination') or ''}".strip(" →"),
+                "depart": details.get("departure") or "",
+                "arrive": details.get("arrival") or "",
+                "duration": details.get("duration") or "",
+                "stops": details.get("stops"),
+                "fare_brand": "Standard",
+                "live_offer_id": offer.get("offer_id") or "",
+                "search_url": details.get("search_url") or "",
+            },
+            provider=provider.name,
+        )
+        quote = provider.quote_flight(option, plan, traveler_count)
+        option["quote"] = quote
+        options.append(option)
+        quotes[option["option_id"]] = quote
+
+    for index, offer in enumerate(live_hotels[:3], start=1):
+        details = dict(offer.get("details") or {})
+        option = make_option(
+            option_id=f"ho_{index}",
+            kind="hotel",
+            title=str(offer.get("title") or "Hotel option"),
+            subtitle=str(offer.get("subtitle") or ""),
+            details={
+                "area": details.get("area") or "",
+                "room_type": details.get("room_type") or "Standard Double",
+                "board": details.get("board") or "Room only",
+                "free_cancellation": bool(details.get("free_cancellation", True)),
+                "live_offer_id": offer.get("offer_id") or "",
+                "search_url": details.get("search_url") or "",
+            },
+            provider=provider.name,
+        )
+        quote = provider.quote_hotel(option, plan, traveler_count)
+        option["quote"] = quote
+        options.append(option)
+        quotes[option["option_id"]] = quote
+
+    # Without live results the researched options are all there is.
+    if not live_flights:
+        flights_raw = flights_raw[:3]
+    else:
+        flights_raw = []
+    if not live_hotels:
+        hotels_raw = hotels_raw[:3]
+    else:
+        hotels_raw = []
 
     for index, item in enumerate(flights_raw[:3], start=1):
         item = item if isinstance(item, dict) else {}
@@ -959,7 +1057,11 @@ Hotel research:
             "estimate_cost",
             f"{totals['total']:.2f} {totals['currency']}",
         ),
-        "progress": progress + [
+        "progress": progress + (
+            [f"Read {', '.join(live_notes)} from the booking site."]
+            if live_notes
+            else []
+        ) + [
             f"Compared {len(options)} options — estimated total "
             f"{totals['total']:.2f} {totals['currency']}."
         ] + notes,
@@ -1029,6 +1131,9 @@ def approval_gate(state: TravelState):
             "start_date": plan.get("start_date", ""),
             "end_date": plan.get("end_date", ""),
             "travelers": plan.get("travelers", []),
+            "budget": plan.get("budget"),
+            "currency": plan.get("currency") or "",
+            "summary": plan.get("summary") or "",
         },
         "purchases": [
             {
@@ -1040,6 +1145,13 @@ def approval_gate(state: TravelState):
             }
             for p in purchases
         ],
+        # Everything the traveller needs to judge the selection: every
+        # option that was compared, the day-by-day plan and the weather.
+        "trip": {
+            "itinerary": state.get("itinerary") or "",
+            "weather": state.get("weather_results") or "",
+            "options": state.get("trip_options") or [],
+        },
         "total": trip_totals(purchases),
         "summary_markdown": describe_selection(purchases, plan),
     }
@@ -1381,6 +1493,7 @@ def verify_booking_agent(state: TravelState):
     tasks = state.get("tasks") or build_tasks("booking")
 
     verified_ok = 0
+    awaiting_payment = 0
     updated = []
 
     for purchase in purchases:
@@ -1394,12 +1507,20 @@ def verify_booking_agent(state: TravelState):
             except ProviderError as error:
                 status = {"reference": reference, "status": "unknown", "raw": {"error": str(error)}}
             purchase["verified"] = status
-            ok = str(status.get("status", "")).lower() in {
+            provider_status = str(status.get("status", "")).lower()
+            if provider_status in {
                 "confirmed", "ok", "booked", "ticketed", "successful", "success",
-            }
-            if ok:
+            }:
                 verified_ok += 1
                 progress.append(f"Verified booking {reference} with the provider.")
+            elif provider_status in ("awaiting_payment", "pending_payment"):
+                # The browser stopped at the payment form: nothing was paid,
+                # so this is not a confirmed booking.
+                awaiting_payment += 1
+                progress.append(
+                    f"Booking {reference} is ready at the payment step — "
+                    "no payment was made by the bot."
+                )
             else:
                 progress.append(
                     f"Provider could not confirm {reference} "
@@ -1408,6 +1529,9 @@ def verify_booking_agent(state: TravelState):
         updated.append(purchase)
 
     all_ok = verified_ok == len(purchases) and len(purchases) > 0
+    all_awaiting = (
+        awaiting_payment == len(purchases) and len(purchases) > 0 and not verified_ok
+    )
     tasks = mark_done(
         mark_done(
             tasks,
@@ -1418,17 +1542,19 @@ def verify_booking_agent(state: TravelState):
         "Provider responses checked",
     )
 
-    status = (
-        BOOK_STATUS.BOOKED.value
-        if all_ok
-        else BOOK_STATUS.BOOKING_FAILED.value
-    )
-    if not all_ok and verified_ok:
+    if all_ok:
+        status = BOOK_STATUS.BOOKED.value
+    elif all_awaiting:
+        status = BOOK_STATUS.AWAITING_PAYMENT.value
+    else:
+        status = BOOK_STATUS.BOOKING_FAILED.value
+
+    if not all_ok and not all_awaiting and verified_ok:
         progress.append(
             f"{verified_ok} of {len(purchases)} purchase(s) confirmed; "
             "the rest failed and were not booked."
         )
-    elif not all_ok:
+    elif not all_ok and not all_awaiting:
         progress.append("No purchase could be confirmed.")
 
     return {
@@ -1459,6 +1585,8 @@ def receipt_agent(state: TravelState):
 
     total = 0.0
     currency = ""
+    pending_payment = False
+    payment_links: list = []
     for purchase in purchases:
         result = purchase.get("result") or {}
         verified = purchase.get("verified") or {}
@@ -1469,18 +1597,43 @@ def receipt_agent(state: TravelState):
         currency = quote.get("currency") or currency
         amount = float(quote.get("total") or 0)
         total += amount
+        booking_state = str(
+            verified.get("status") or result.get("status") or ""
+        ).lower()
+        if booking_state in ("awaiting_payment", "pending_payment"):
+            pending_payment = True
+            checkout_url = ((result.get("raw") or {}).get("checkout") or {}).get(
+                "url"
+            )
+            if checkout_url:
+                payment_links.append(
+                    (
+                        (
+                            "Flight"
+                            if purchase.get("kind") == "flight"
+                            else "Hotel"
+                        )
+                        + f": {(purchase.get('option') or {}).get('title', '')}",
+                        checkout_url,
+                    )
+                )
         label = (
             "Flight" if purchase.get("kind") == "flight" else "Hotel"
         ) + f": {(purchase.get('option') or {}).get('title', '')}"
+        paid_cell = (
+            f"{amount:.2f} {quote.get('currency', '')}"
+            if booking_state not in ("awaiting_payment", "pending_payment")
+            else "not paid"
+        )
         lines.append(
             f"| {label} | `{reference}` | "
             f"{verified.get('status') or result.get('status')} | "
-            f"{amount:.2f} {quote.get('currency', '')} |"
+            f"{paid_cell} |"
         )
         record = new_record(
             purchase.get("kind") or "booking",
             reference,
-            status="confirmed",
+            status=verified.get("status") or result.get("status") or "confirmed",
             approval_id=(purchase.get("approval") or {}).get("approval_id"),
             provider=quote.get("provider") or "",
             title=(purchase.get("option") or {}).get("title", ""),
@@ -1490,12 +1643,37 @@ def receipt_agent(state: TravelState):
                 "end_date": plan.get("end_date", ""),
             },
             travelers=plan.get("travelers") or [],
+            checkout_url=((result.get("raw") or {}).get("checkout") or {}).get(
+                "url"
+            ),
+            payment_required=bool(
+                (result.get("raw") or {}).get("payment_required")
+            ),
         )
         if not any(r.get("reference") == reference for r in records):
             records.append(record)
             _save_booking_record(thread_id, record)
 
-    lines += ["", f"**Total paid:** {total:.2f} {currency}".rstrip()]
+    total_label = (
+        "Total awaiting your payment"
+        if pending_payment
+        else "Total paid"
+    )
+    lines += ["", f"**{total_label}:** {total:.2f} {currency}".rstrip()]
+
+    if payment_links:
+        lines += [
+            "",
+            "### Finish the payment yourself",
+            "",
+            "The bot stopped at the payment form — no card details were "
+            "typed and nothing was charged. Open the link, check the "
+            "details and pay:",
+            "",
+        ]
+        for label, url in payment_links:
+            lines.append(f"- **{label}:** {url}")
+
     receipt = "\n".join(lines)
 
     tasks = mark_done(
@@ -1775,7 +1953,12 @@ def route_after_execute(state: TravelState) -> str:
 
 
 def route_after_verify(state: TravelState) -> str:
-    if state.get("booking_status") == BOOK_STATUS.BOOKED.value:
+    if state.get("booking_status") in (
+        BOOK_STATUS.BOOKED.value,
+        BOOK_STATUS.AWAITING_PAYMENT.value,
+    ):
+        # A reservation that is ready for payment still gets a receipt:
+        # the user needs the reference and the link to finish paying.
         return "receipt"
     return "final"
 
@@ -2305,6 +2488,91 @@ def _approval_markdown(payload: dict) -> str:
 
     lines.append(payload.get("summary_markdown") or "")
 
+    # ---- full trip context ------------------------------------------------
+    plan = payload.get("plan") or {}
+    trip = payload.get("trip") or {}
+    selected_ids = {
+        str((purchase.get("option") or {}).get("option_id") or "")
+        for purchase in purchases
+    }
+
+    options = trip.get("options") or []
+    if options:
+        lines += [
+            "",
+            "### All options considered",
+            "",
+            "The ✅ row is the option included in the approval above.",
+            "",
+            "| Type | Option | Details | Total |",
+            "| --- | --- | --- | ---: |",
+        ]
+        for option in options:
+            details = option.get("details") or {}
+            quote = option.get("quote") or {}
+            bits = []
+            for key in (
+                "airline", "route", "depart", "departure", "arrive", "arrival",
+                "duration", "stops", "area", "room_type", "board",
+                "review_score",
+            ):
+                value = details.get(key)
+                if value not in ("", None, [], {}):
+                    bits.append(" ".join(str(value).split()))
+            if not bits and option.get("subtitle"):
+                bits.append(" ".join(str(option["subtitle"]).split()))
+            selected = (
+                " ✅ selected"
+                if str(option.get("option_id") or "") in selected_ids
+                else ""
+            )
+            kind = "Flight" if option.get("kind") == "flight" else "Hotel"
+            title = " ".join(str(option.get("title") or "—").split())
+            details_text = " · ".join(bits) or "—"
+            total_text = (
+                f"{float(quote.get('total') or 0):.2f} "
+                f"{quote.get('currency') or ''}"
+            ).strip()
+            lines.append(
+                f"| {kind} | {title}{selected} | {details_text} | {total_text} |"
+            )
+
+    if any(plan.get(key) for key in ("origin", "destination", "budget")):
+        context = []
+        if plan.get("origin") or plan.get("destination"):
+            context.append(
+                f"**Route:** {plan.get('origin') or '—'} ✈ "
+                f"{plan.get('destination') or '—'}"
+            )
+        if plan.get("start_date") or plan.get("end_date"):
+            context.append(
+                f"**Dates:** {plan.get('start_date') or '—'} → "
+                f"{plan.get('end_date') or '—'}"
+            )
+        if plan.get("budget"):
+            context.append(
+                f"**Budget:** {float(plan['budget']):.2f} "
+                f"{plan.get('currency') or ''}".strip()
+            )
+        if context:
+            lines += ["", "### Trip context", ""] + context
+
+    if trip.get("itinerary"):
+        lines += [
+            "",
+            "### 🗓️ Day-by-day itinerary",
+            "",
+            str(trip["itinerary"]).strip(),
+        ]
+
+    if trip.get("weather"):
+        lines += [
+            "",
+            "### 🌤️ Weather",
+            "",
+            str(trip["weather"]).strip(),
+        ]
+
     total = payload.get("total") or {}
     lines += [
         "",
@@ -2329,7 +2597,13 @@ def _approval_markdown(payload: dict) -> str:
 
 def _booking_cta(result: dict) -> str:
     status = result.get("booking_status") or ""
-    if status in (BookingStatus.BOOKED.value, BookingStatus.CANCELLED.value):
+    if status in (
+        BookingStatus.BOOKED.value,
+        BookingStatus.AWAITING_PAYMENT.value,
+        BookingStatus.CANCELLED.value,
+    ):
+        # Nothing is left to prepare: it is either paid for, or the user has
+        # to finish the payment on the provider's site.
         return ""
     totals = trip_totals(result.get("purchases") or [])
     if not totals["total"]:
@@ -2357,7 +2631,12 @@ def _build_response(thread_id: str, result: dict) -> dict:
         links = {}
     else:
         answer = result["messages"][-1].content if result.get("messages") else ""
-        if status in (BookingStatus.BOOKED.value, BookingStatus.CANCELLED.value):
+        if status in (
+            BookingStatus.BOOKED.value,
+            BookingStatus.AWAITING_PAYMENT.value,
+            BookingStatus.CANCELLED.value,
+        ):
+            # The receipt carries the checkout/payment link in these states.
             links = {}
         else:
             answer = f"{answer}{booking_markdown(booking)}"
@@ -2647,11 +2926,22 @@ def get_booking_state(thread_id: str) -> dict:
         "receipt": values.get("receipt") or "",
         "booking_records": records,
         "total": trip_totals(values.get("purchases") or []),
+        # Full trip context, so a client that missed the approval message
+        # can still show every detail before deciding.
+        "itinerary": values.get("itinerary") or "",
+        "weather_results": values.get("weather_results") or "",
+        "flight_results": values.get("flight_results") or "",
+        "hotel_results": values.get("hotel_results") or "",
+        "trip_options": values.get("trip_options") or [],
+        "changes_summary": values.get("changes_summary") or [],
         "plan": {
             "origin": plan.get("origin", ""),
             "destination": plan.get("destination", ""),
             "start_date": plan.get("start_date", ""),
             "end_date": plan.get("end_date", ""),
             "travelers": plan.get("travelers", []),
+            "budget": plan.get("budget"),
+            "currency": plan.get("currency") or "",
+            "summary": plan.get("summary") or "",
         },
     }

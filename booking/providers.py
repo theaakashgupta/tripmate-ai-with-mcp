@@ -52,6 +52,45 @@ def _pct(value: float, pct: float) -> float:
     return round(value * pct / 100.0, 2)
 
 
+# Fare-brand rules shared by every provider so a quote says the same thing
+# about baggage and cancellation no matter where the price came from.
+FARE_BRAND_CONDITIONS = {
+    "Basic": {
+        "baggage": "1 cabin bag (7kg) only",
+        "cancellation_policy": "Non-refundable",
+        "changes": "No changes permitted",
+        "refundable": False,
+        "fee_per_traveler": 12.0,
+    },
+    "Standard": {
+        "baggage": "1 cabin bag (7kg) + 1 checked bag (23kg)",
+        "cancellation_policy": "Refundable with a fee up to 24h before departure",
+        "changes": "Changes allowed, fare difference applies",
+        "refundable": False,
+        "fee_per_traveler": 24.0,
+    },
+    "Flex": {
+        "baggage": "1 cabin bag (7kg) + 2 checked bags (23kg each)",
+        "cancellation_policy": "Fully refundable until 24h before departure",
+        "changes": "Free changes, no fare difference on the same cabin",
+        "refundable": True,
+        "fee_per_traveler": 39.0,
+    },
+}
+
+
+def fare_brand_conditions(brand: str | None) -> dict:
+    """Baggage/cancellation rules for a fare brand."""
+    key = str(brand or "Standard").strip().title()
+    config = FARE_BRAND_CONDITIONS.get(key, FARE_BRAND_CONDITIONS["Standard"])
+    return {
+        "baggage": config["baggage"],
+        "cancellation_policy": config["cancellation_policy"],
+        "changes": config["changes"],
+        "refundable": config["refundable"],
+    }
+
+
 class SimulatedBookingProvider:
     """Deterministic stand-in for a booking provider API."""
 
@@ -73,30 +112,7 @@ class SimulatedBookingProvider:
         brand = details.get("fare_brand") or "Standard"
         base_per_traveler = _seeded_range(seed, 165, 640)
 
-        brand_config = {
-            "Basic": {
-                "baggage": "1 cabin bag (7kg) only",
-                "cancellation_policy": "Non-refundable",
-                "changes": "No changes permitted",
-                "refundable": False,
-                "fee_per_traveler": 12.0,
-            },
-            "Standard": {
-                "baggage": "1 cabin bag (7kg) + 1 checked bag (23kg)",
-                "cancellation_policy": "Refundable with a fee up to 24h before departure",
-                "changes": "Changes allowed, fare difference applies",
-                "refundable": False,
-                "fee_per_traveler": 24.0,
-            },
-            "Flex": {
-                "baggage": "1 cabin bag (7kg) + 2 checked bags (23kg each)",
-                "cancellation_policy": "Fully refundable until 24h before departure",
-                "changes": "Free changes, no fare difference on the same cabin",
-                "refundable": True,
-                "fee_per_traveler": 39.0,
-            },
-        }
-        config = brand_config.get(brand, brand_config["Standard"])
+        config = FARE_BRAND_CONDITIONS.get(brand, FARE_BRAND_CONDITIONS["Standard"])
 
         taxes = _pct(base_per_traveler, 12.0)
         fees = float(config["fee_per_traveler"])
@@ -486,22 +502,76 @@ class HttpBookingProvider:
 _provider_cache: dict = {}
 
 
+def provider_mode() -> str:
+    """Which provider to use.
+
+    * ``browser`` / ``playwright`` - drive a real browser (needs Playwright)
+    * ``http``                     - talk to a provider REST API
+    * ``simulated`` (default)      - the offline stand-in
+    """
+    explicit = (os.getenv("BOOKING_PROVIDER_MODE") or "").strip().lower()
+    if explicit:
+        if explicit in ("browser", "playwright", "pw"):
+            return "playwright"
+        if explicit in ("http", "rest", "api"):
+            return "http"
+        if explicit in ("simulated", "sim", "offline", "fake"):
+            return "simulated"
+    if (os.getenv("BOOKING_PROVIDER_BASE_URL") or "").strip():
+        return "http"
+    return "simulated"
+
+
 def get_provider():
-    """Configured provider: HTTP when BOOKING_PROVIDER_BASE_URL is set."""
-    cache_key = os.getenv("BOOKING_PROVIDER_BASE_URL") or "simulated"
+    """The configured provider.
+
+    The Playwright provider is imported lazily so the rest of the app keeps
+    working when Playwright is not installed.
+    """
+    mode = provider_mode()
+    cache_key = mode
+    if mode == "http":
+        cache_key = f"http:{os.getenv('BOOKING_PROVIDER_BASE_URL')}"
     if cache_key in _provider_cache:
         return _provider_cache[cache_key]
 
-    base_url = (os.getenv("BOOKING_PROVIDER_BASE_URL") or "").strip()
-    if base_url:
+    if mode == "playwright":
+        try:
+            from .playwright_provider import PlaywrightBookingProvider
+        except ImportError as error:
+            raise ProviderError(
+                "Browser automation is selected but Playwright is not installed. "
+                "Run: pip install playwright && python -m playwright install chromium",
+                transient=False,
+            ) from error
+        provider = PlaywrightBookingProvider()
+    elif mode == "http":
         provider = HttpBookingProvider(
-            base_url, (os.getenv("BOOKING_PROVIDER_API_KEY") or "").strip()
+            (os.getenv("BOOKING_PROVIDER_BASE_URL") or "").strip(),
+            (os.getenv("BOOKING_PROVIDER_API_KEY") or "").strip(),
         )
     else:
         provider = SimulatedBookingProvider()
 
     _provider_cache[cache_key] = provider
     return provider
+
+
+def close_provider() -> None:
+    """Close every cached provider and forget it.
+
+    The Playwright provider owns a browser process, so the app calls this on
+    shutdown; otherwise Chromium outlives the server. Errors are swallowed:
+    teardown must never take the process down with it.
+    """
+    for provider in list(_provider_cache.values()):
+        close = getattr(provider, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+    _provider_cache.clear()
 
 
 def with_retries(fn, attempts: int = 2, logger=print):

@@ -26,6 +26,9 @@ class BookingStatus(str, Enum):
     APPROVAL_REQUIRED_AGAIN = "APPROVAL_REQUIRED_AGAIN"
     CANCEL_PENDING = "CANCEL_PENDING"
     CANCELLED = "CANCELLED"
+    # The browser filled in the traveller details and stopped at the payment
+    # form. Nothing has been paid yet, so this is not a confirmed booking.
+    AWAITING_PAYMENT = "AWAITING_PAYMENT"
 
 
 # Statuses where money has been committed (or is being committed).
@@ -40,6 +43,7 @@ WAITING_STATUSES = {
     BookingStatus.AWAITING_USER_APPROVAL.value,
     BookingStatus.CANCEL_PENDING.value,
     BookingStatus.APPROVAL_REQUIRED_AGAIN.value,
+    BookingStatus.AWAITING_PAYMENT.value,
 }
 
 
@@ -54,6 +58,7 @@ STATUS_LABELS = {
     BookingStatus.APPROVAL_REQUIRED_AGAIN.value: "Approval required again",
     BookingStatus.CANCEL_PENDING.value: "Cancellation pending approval",
     BookingStatus.CANCELLED.value: "Cancelled",
+    BookingStatus.AWAITING_PAYMENT.value: "Awaiting your payment",
 }
 
 

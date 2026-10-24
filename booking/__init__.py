@@ -22,7 +22,22 @@ from .approval import (
     material_changes,
     validate_approval,
 )
-from .providers import ProviderError, get_provider, with_retries
+from .providers import (
+    ProviderError,
+    close_provider,
+    fare_brand_conditions,
+    get_provider,
+    provider_mode,
+    with_retries,
+)
+from .browser import (
+    BrowserOffer,
+    BrowserSession,
+    CheckoutResult,
+    SiteAdapter,
+    available_kinds,
+    resolve_adapter,
+)
 from .tasks import (
     CANCEL_NEGATED_RE,
     ask_for_missing,
@@ -60,7 +75,16 @@ __all__ = [
     "validate_approval",
     "ProviderError",
     "get_provider",
+    "close_provider",
+    "provider_mode",
+    "fare_brand_conditions",
     "with_retries",
+    "BrowserOffer",
+    "BrowserSession",
+    "CheckoutResult",
+    "SiteAdapter",
+    "available_kinds",
+    "resolve_adapter",
     "ask_for_missing",
     "build_tasks",
     "decision_help",

@@ -260,6 +260,8 @@ function renderStatusBadge(data) {
         text = "Waiting for your explicit approval — nothing has been purchased.";
     } else if (status === "BOOKED") {
         text = "Every approved purchase was confirmed by the provider.";
+    } else if (status === "AWAITING_PAYMENT") {
+        text = "The browser filled in the traveller details and stopped at the payment form — nothing has been paid yet. Finish the payment on the provider's site.";
     } else if (status === "BOOKING_FAILED") {
         text = "The provider did not confirm everything — unconfirmed items were not charged.";
     } else if (status === "CANCELLED") {
@@ -321,10 +323,140 @@ function escapeHtml(value) {
 }
 
 
+function safeUrl(value) {
+    const url = String(value || "").trim();
+    return /^https?:\/\//i.test(url) ? url : "";
+}
+
+
+function renderMarkdown(text) {
+    if (typeof marked !== "undefined") {
+        return marked.parse(text);
+    }
+    return escapeHtml(text).replace(/\n/g, "<br>");
+}
+
+
+function renderTripDetails(approval) {
+    const box = document.getElementById("tripDetails");
+    const plan = approval.plan || {};
+    const trip = approval.trip || {};
+    const options = trip.options || [];
+    const itinerary = trip.itinerary || "";
+    const weather = trip.weather || "";
+
+    if (!options.length && !itinerary && !weather) {
+        box.classList.add("hidden");
+        return;
+    }
+
+    // ---- trip summary -------------------------------------------------
+    const total = approval.total || {};
+    const bits = [];
+    const travelers = (plan.travelers || [])
+        .map(function(traveler) { return traveler.name; })
+        .filter(Boolean)
+        .join(", ");
+
+    if (travelers) {
+        bits.push("<strong>Traveler(s):</strong> " + escapeHtml(travelers));
+    }
+    if (plan.origin || plan.destination) {
+        bits.push("<strong>Route:</strong> " +
+            escapeHtml(plan.origin || "—") + " ✈ " +
+            escapeHtml(plan.destination || "—"));
+    }
+    if (plan.start_date || plan.end_date) {
+        bits.push("<strong>Dates:</strong> " +
+            escapeHtml(plan.start_date || "—") + " → " +
+            escapeHtml(plan.end_date || "—"));
+    }
+    if (plan.budget) {
+        bits.push("<strong>Budget:</strong> " +
+            money(plan.budget, plan.currency));
+    }
+    bits.push("<strong>Estimated total:</strong> " +
+        money(total.total, total.currency));
+
+    document.getElementById("tripSummary").innerHTML = bits.join(" · ");
+
+    // ---- every option that was compared -------------------------------
+    const optionsCard = document.getElementById("tripOptionsCard");
+    const optionsBox = document.getElementById("tripOptions");
+
+    if (options.length) {
+        const selectedIds = {};
+        (approval.purchases || []).forEach(function(purchase) {
+            selectedIds[(purchase.option || {}).option_id] = true;
+        });
+
+        const rows = options.map(function(option) {
+            const quote = option.quote || {};
+            const details = option.details || {};
+            const extra = [];
+
+            [
+                "airline", "route", "depart", "departure", "arrive", "arrival",
+                "duration", "stops", "area", "room_type", "board", "review_score"
+            ].forEach(function(key) {
+                if (details[key]) {
+                    extra.push(String(details[key]).replace(/\s+/g, " "));
+                }
+            });
+
+            const selected = selectedIds[option.option_id]
+                ? ' <span class="trip-selected">selected</span>'
+                : "";
+
+            return "<tr>" +
+                "<td>" + escapeHtml(option.kind === "flight" ? "Flight" : "Hotel") + "</td>" +
+                "<td><strong>" + escapeHtml(option.title || "—") + "</strong>" + selected +
+                    (extra.length
+                        ? '<div class="trip-option-details">' +
+                          escapeHtml(extra.join(" · ")) + "</div>"
+                        : "") +
+                "</td>" +
+                '<td class="amount">' + money(quote.total, quote.currency) + "</td>" +
+                "</tr>";
+        }).join("");
+
+        optionsBox.innerHTML =
+            '<table class="trip-options-table">' +
+                "<thead><tr><th>Type</th><th>Option</th><th>Total</th></tr></thead>" +
+                "<tbody>" + rows + "</tbody>" +
+            "</table>";
+        optionsCard.classList.remove("hidden");
+    } else {
+        optionsCard.classList.add("hidden");
+    }
+
+    // ---- itinerary and weather ----------------------------------------
+    const itineraryCard = document.getElementById("tripItineraryCard");
+    const weatherCard = document.getElementById("tripWeatherCard");
+
+    if (itinerary) {
+        document.getElementById("tripItinerary").innerHTML = renderMarkdown(itinerary);
+        itineraryCard.classList.remove("hidden");
+    } else {
+        itineraryCard.classList.add("hidden");
+    }
+
+    if (weather) {
+        document.getElementById("tripWeather").innerHTML = renderMarkdown(weather);
+        weatherCard.classList.remove("hidden");
+    } else {
+        weatherCard.classList.add("hidden");
+    }
+
+    box.classList.remove("hidden");
+}
+
+
 function purchaseCard(purchase) {
     const option = purchase.option || {};
     const quote = purchase.quote || {};
     const conditions = quote.conditions || {};
+    const details = option.details || {};
     const approval = purchase.approval || {};
 
     const card = document.createElement("div");
@@ -338,12 +470,41 @@ function purchaseCard(purchase) {
     }).join("");
 
     const facts = [];
+    const dateLabels = {
+        departure: "Departure date",
+        return: "Return date",
+        depart_time: "Departure time",
+        return_time: "Arrival time",
+        check_in: "Check-in",
+        check_out: "Check-out"
+    };
+
     if (quote.dates) {
         Object.keys(quote.dates).forEach(function(key) {
             if (quote.dates[key]) {
-                facts.push(key.replace(/_/g, " ") + ": " + quote.dates[key]);
+                facts.push((dateLabels[key] || key.replace(/_/g, " ")) +
+                    ": " + quote.dates[key]);
             }
         });
+    }
+    if (purchase.kind === "flight") {
+        if (details.airline) facts.push("Airline: " + details.airline);
+        if (details.route) facts.push("Route: " + details.route);
+        if (details.depart || details.departure || details.arrive || details.arrival) {
+            facts.push("Time: " + (details.depart || details.departure || "—") +
+                " → " + (details.arrive || details.arrival || "—"));
+        }
+        if (details.duration) facts.push("Duration: " + details.duration);
+        if (details.stops) facts.push("Stops: " + details.stops);
+    } else {
+        if (details.area) facts.push("Area: " + details.area);
+        if (details.review_score) facts.push("Rating: " + details.review_score);
+        if (details.room_type) facts.push("Room type: " + details.room_type);
+        if (details.board) facts.push("Board: " + details.board);
+        if (details.free_cancellation !== undefined) {
+            facts.push("Free cancellation: " +
+                (details.free_cancellation ? "yes" : "no"));
+        }
     }
     if (quote.room_type) facts.push("Room type: " + quote.room_type);
     if (conditions.fare_brand) facts.push("Fare brand: " + conditions.fare_brand);
@@ -353,6 +514,18 @@ function purchaseCard(purchase) {
         facts.push("Cancellation: " + conditions.cancellation_policy);
     }
     if (conditions.changes) facts.push("Changes: " + conditions.changes);
+    if (conditions.live_source) facts.push("Live source: " + conditions.live_source);
+    if (quote.price_source) {
+        facts.push("Price source: " + String(quote.price_source).replace(/_/g, " "));
+    }
+
+    const uniqueFacts = facts.filter(function(fact, index) {
+        return facts.indexOf(fact) === index;
+    });
+
+    const offerUrl = safeUrl(
+        details.property_url || details.airline_url || details.search_url
+    );
 
     card.innerHTML =
         '<div class="approval-card-head">' +
@@ -362,10 +535,14 @@ function purchaseCard(purchase) {
         "<h4>" + escapeHtml(option.title || "Selected option") + "</h4>" +
         '<p class="approval-sub">' + escapeHtml(option.subtitle || "") + "</p>" +
         '<ul class="approval-facts">' +
-            facts.map(function(fact) {
+            uniqueFacts.map(function(fact) {
                 return "<li>" + escapeHtml(fact) + "</li>";
             }).join("") +
         "</ul>" +
+        (offerUrl
+            ? '<p class="approval-link"><a href="' + escapeHtml(offerUrl) +
+              '" target="_blank" rel="noopener noreferrer">View the live offer ↗</a></p>'
+            : "") +
         '<table class="approval-table">' +
             "<thead><tr><th>Price breakdown</th><th>Amount</th></tr></thead>" +
             "<tbody>" + rows + "</tbody>" +
@@ -414,7 +591,10 @@ function renderApproval(approval) {
         document.getElementById("rejectAllBtn").textContent = "Keep my booking";
         document.getElementById("modifyBtn").classList.add("hidden");
         document.getElementById("modifyInput").classList.add("hidden");
+        document.getElementById("tripDetails").classList.add("hidden");
     } else {
+        renderTripDetails(approval);
+
         if (approval.reapproval_required) {
             notice.innerHTML = "<strong>⚠️ Approval required again</strong><br>" +
                 (approval.reasons || []).map(escapeHtml).join("<br>");
